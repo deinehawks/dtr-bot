@@ -28,9 +28,7 @@ scope = [
 ]
 
 # Path to secret file mounted by Render
-cred_path = "/run/secrets/google_credentials.json"
-
-# Load credentials from file
+cred_path = "/etc/secrets/google_credentials.json"
 creds = ServiceAccountCredentials.from_json_keyfile_name(cred_path, scope)
 
 client = gspread.authorize(creds)
