@@ -8,15 +8,11 @@ import json
 import os
 import random
 import webserver
-from dotenv import load_dotenv
 
 # ---------------- CONFIG ---------------- #
-load_dotenv()
-# Timezone and basic DTR configuration
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-
 if not DISCORD_TOKEN:
-    raise ValueError("Discord token not found! Please set the DISCORD_TOKEN environment variable.")
+    raise ValueError("DISCORD_TOKEN not set")
 
 TIMEZONE = pytz.timezone("Asia/Manila")
 AM_IN_CUTOFF = (10, 0)            # 10:00 AM - late threshold (hour, minute)
