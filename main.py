@@ -734,6 +734,7 @@ async def help_dtr(ctx):
     await ctx.send(help_text)
 
 # ---------------- RUN ---------------- #
+if __name__ == "__main__":
+    webserver.keep_alive()
+    bot.run(DISCORD_TOKEN)
 
-webserver.keep_alive()
-bot.run(DISCORD_TOKEN)
