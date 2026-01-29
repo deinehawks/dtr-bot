@@ -497,10 +497,10 @@ async def am_in(ctx):
     record = get_full_record(name)
     message = format_record_message(name, record)
     
-    current_hour = now().hour
+    current_time = (now().hour, now().minute)
 
     # Morning person
-    if current_hour < MORNING_PERSON_CUTOFF and messages["morning_person"]:
+    if current_time < MORNING_PERSON_CUTOFF and messages["morning_person"]:
         message += "\n" + random.choice(messages["morning_person"])
     # Late
     elif late_status and messages["late"]:
