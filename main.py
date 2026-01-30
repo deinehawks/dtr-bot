@@ -7,7 +7,6 @@ import pytz
 import json
 import os
 import random
-import webserver
 
 # ---------------- CONFIG ---------------- #
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
@@ -735,6 +734,5 @@ async def help_dtr(ctx):
 
 # ---------------- RUN ---------------- #
 if __name__ == "__main__":
-    webserver.keep_alive()
     bot.run(DISCORD_TOKEN)
 
