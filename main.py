@@ -20,7 +20,7 @@ PORT = int(os.getenv("PORT", 8080))  # Render provides PORT env variable
 
 TIMEZONE = pytz.timezone("Asia/Manila")
 AM_IN_CUTOFF = (10, 0)            # 10:00 AM - late threshold (hour, minute)
-REQUIRED_HOURS = 8                # Required work hours per day
+REQUIRED_HOURS = 0.1                # Required work hours per day
 MORNING_PERSON_CUTOFF = (7, 44)   # Anyone before this is a morning person
 # ---------------------------------------- #
 
@@ -1021,7 +1021,7 @@ async def help_dtr(ctx):
 
 # ---------------- REMINDER ---------------- #
 
-REMINDER_THRESHOLD_MINUTES = 5  # Minutes before 8 hours
+REMINDER_THRESHOLD_MINUTES = 1  # Minutes before 8 hours
 
 async def reminder_loop():
     await bot.wait_until_ready()  # ensure bot is fully online
