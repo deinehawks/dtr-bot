@@ -7,17 +7,21 @@ import pytz
 import json
 import os
 import random
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # ---------------- CONFIG ---------------- #
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 if not DISCORD_TOKEN:
     raise ValueError("DISCORD_TOKEN not set")
 
+PORT = int(os.getenv("PORT", 8080))  # Render provides PORT env variable
+
 TIMEZONE = pytz.timezone("Asia/Manila")
 AM_IN_CUTOFF = (10, 0)            # 10:00 AM - late threshold (hour, minute)
 REQUIRED_HOURS = 8                # Required work hours per day
-ADMIN_IDS = [1429858548392792288] # Add Discord user IDs of admins here (ints)
-MORNING_PERSON_CUTOFF = (7, 44)   # Anyone before this is a morning person
+ADMIN_IDS = [1429858548392792288, 896989800786190337, 830704365438369792] # Add Discord user IDs of admins here (ints)
+MORNING_PERSON_CUTOFF = (7, 40)   # Anyone before this is a morning person
 # ---------------------------------------- #
 
 # --- Google Sheets Setup ---
@@ -363,6 +367,33 @@ if os.path.exists(MESSAGES_FILE):
 
 else:
     messages = {"morning_person": [], "normal": [], "late": []}
+
+# ---------------- HTTP SERVER ---------------- #
+
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    """Simple HTTP handler for health checks - thread-safe by design"""
+    
+    def do_GET(self):
+        """Handle GET requests - only responds to health check endpoint"""
+        if self.path == '/' or self.path == '/health':
+            self.send_response(200)
+            self.send_header('Content-type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(b'OK')
+        else:
+            self.send_response(404)
+            self.end_headers()
+    
+    def log_message(self, format, *args):
+        """Suppress default logging to avoid clutter"""
+        pass
+
+def run_http_server():
+    """Run HTTP server in background thread"""
+    server = HTTPServer(('0.0.0.0', PORT), HealthCheckHandler)
+    print(f"HTTP server running on port {PORT}")
+    server.serve_forever()
+
 # ---------------- ERROR HANDLER ---------------- #
 
 @bot.event
@@ -734,5 +765,9 @@ async def help_dtr(ctx):
 
 # ---------------- RUN ---------------- #
 if __name__ == "__main__":
+    # Start HTTP server in background thread
+    server_thread = threading.Thread(target=run_http_server, daemon=True)
+    server_thread.start()
+    
+    # Run Discord bot (blocking)
     bot.run(DISCORD_TOKEN)
-
