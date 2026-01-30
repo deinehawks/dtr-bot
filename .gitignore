@@ -53,3 +53,6 @@ dmypy.json
 .env.*
 
 google_credentials.json
+admins.json
+users.json
+messages.json

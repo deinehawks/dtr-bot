@@ -20,8 +20,7 @@ PORT = int(os.getenv("PORT", 8080))  # Render provides PORT env variable
 TIMEZONE = pytz.timezone("Asia/Manila")
 AM_IN_CUTOFF = (10, 0)            # 10:00 AM - late threshold (hour, minute)
 REQUIRED_HOURS = 8                # Required work hours per day
-ADMIN_IDS = [1429858548392792288, 896989800786190337, 830704365438369792] # Add Discord user IDs of admins here (ints)
-MORNING_PERSON_CUTOFF = (7, 44)   # Anyone before this is a morning person
+MORNING_PERSON_CUTOFF = (7, 40)   # Anyone before this is a morning person
 # ---------------------------------------- #
 
 # --- Google Sheets Setup ---
@@ -48,6 +47,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # Pre-loaded users - no registration needed!
 # Format: {"discord_id": "Full Name"}
 USERS_FILE = "users.json"
+ADMINS_FILE = "admins.json"
 
 if os.path.exists(USERS_FILE):
     with open(USERS_FILE, "r") as f:
@@ -55,10 +55,21 @@ if os.path.exists(USERS_FILE):
 else:
     # Default empty users - add your team members here or use !add_user command
     user_names = {}
-
     # Save the default
     with open(USERS_FILE, "w") as f:
         json.dump(user_names, f, indent=4)
+
+# Load admin IDs from separate file for security
+if os.path.exists(ADMINS_FILE):
+    with open(ADMINS_FILE, "r") as f:
+        admin_data = json.load(f)
+        ADMIN_IDS = admin_data.get("admin_ids", [])
+else:
+    # Default empty admins - YOU MUST ADD AT LEAST ONE ADMIN
+    ADMIN_IDS = []
+    with open(ADMINS_FILE, "w") as f:
+        json.dump({"admin_ids": []}, f, indent=4)
+    print("⚠️  WARNING: No admins configured! Please add admin IDs to admins.json")
 # ----------------------------------------
 
 # ---------------- HELPERS ---------------- #
@@ -396,13 +407,13 @@ async def on_command_error(ctx, error):
         command = ctx.command.name if ctx.command else "command"
         
         if command == "add_user":
-            await ctx.send("**Usage:** `!add_user @username Full Name`\n\nExample: `!add_user @john Juan Dela Cruz`")
+            await ctx.send("❌ **Usage:** `!add_user @username Full Name`\n\nExample: `!add_user @john Juan Dela Cruz`")
         elif command == "change_name":
-            await ctx.send("**Usage:** `!change_name @username New Full Name`\n\nExample: `!change_name @john Juan Miguel Cruz`")
+            await ctx.send("❌ **Usage:** `!change_name @username New Full Name`\n\nExample: `!change_name @john Juan Miguel Cruz`")
         elif command == "remove_user":
-            await ctx.send("**Usage:** `!remove_user @username`\n\nExample: `!remove_user @john`")
+            await ctx.send("❌ **Usage:** `!remove_user @username`\n\nExample: `!remove_user @john`")
         else:
-            await ctx.send(f"Oops! This command needs more information.\n\nTry `!help_dtr` to see how to use it.")
+            await ctx.send(f"❌ Oops! This command needs more information.\n\nTry `!help_dtr` to see how to use it.")
     
     elif isinstance(error, commands.CommandNotFound):
         # ignore unknown commands silently
@@ -496,11 +507,41 @@ async def list_users(ctx):
         await ctx.send("No users in the system yet.")
         return
 
-    user_list = "\n".join([
-        f"• {format_name_with_initials(name)} (ID: {uid})" 
-        for uid, name in user_names.items()
-    ])
-    await ctx.send(f"**Authorized Users ({len(user_names)}):**\n\n{user_list}")
+    user_list = []
+    for uid, name in user_names.items():
+        formatted_name = format_name_with_initials(name)
+        # Check if this user is an admin (but don't show their ID)
+        if int(uid) in ADMIN_IDS:
+            user_list.append(f"• {formatted_name} ADMIN")
+        else:
+            user_list.append(f"• {formatted_name}")
+    
+    users_display = "\n".join(user_list)
+    
+    # Count admins
+    admin_count = sum(1 for uid in user_names.keys() if int(uid) in ADMIN_IDS)
+    
+    await ctx.send(
+        f"**Authorized Users ({len(user_names)}):**\n"
+        f"👑 Admins: {admin_count} | Regular Users: {len(user_names) - admin_count}\n\n"
+        f"{users_display}"
+    )
+
+@bot.command()
+async def users(ctx):
+    """List all users in the DTR system (anyone can use this)."""
+    if not user_names:
+        await ctx.send("No users in the system yet.")
+        return
+
+    # Sort users alphabetically by name
+    sorted_users = sorted(
+        [(format_name_with_initials(name), name) for name in user_names.values()],
+        key=lambda x: x[0]
+    )
+    
+    user_list = "\n".join([f"• {formatted_name}" for formatted_name, _ in sorted_users])
+    await ctx.send(f"**DTR System Users ({len(user_names)}):**\n\n{user_list}")
 
 # ---------------- Clock commands ---------------- #
 
