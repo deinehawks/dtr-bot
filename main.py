@@ -81,7 +81,7 @@ else:
     if not ADMINS_FILE.startswith("/etc/secrets"):
         with open(ADMINS_FILE, "w") as f:
             json.dump({"admin_ids": []}, f, indent=4)
-    print("⚠️  WARNING: No admins configured! Please add admin IDs to admins.json")
+    print("WARNING: No admins configured! Please add admin IDs to admins.json")
 # ----------------------------------------
 
 # ---------------- HELPERS ---------------- #
@@ -107,13 +107,9 @@ def pretty_date():
 
 def timestamp_str():
     """Full timestamp used for the sheet Timestamp column:
-       Format: M/D/YYYY H:MM:SS AM/PM"""
+       Format: M/D/YYYY HH:MM:SS (24-hour format)"""
     n = now()
-    hour_12 = n.hour % 12
-    if hour_12 == 0:
-        hour_12 = 12
-    am_pm = "AM" if n.hour < 12 else "PM"
-    return f"{n.month}/{n.day}/{n.year} {hour_12}:{n.minute:02d}:{n.second:02d} {am_pm}"
+    return f"{n.month}/{n.day}/{n.year} {n.hour}:{n.minute:02d}:{n.second:02d}"
 
 # --- Time formatting helpers (SHEET vs DISCORD) ---
 def time_for_sheets():
