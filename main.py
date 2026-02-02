@@ -405,15 +405,32 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
     
+    def do_HEAD(self):
+        """Handle HEAD requests - UptimeRobot uses these for monitoring"""
+        if self.path == '/' or self.path == '/health':
+            self.send_response(200)
+            self.send_header('Content-type', 'text/plain')
+            self.end_headers()
+            # HEAD requests don't send a body
+        else:
+            self.send_response(404)
+            self.end_headers()
+    
     def log_message(self, format, *args):
         """Suppress default logging to avoid clutter"""
         pass
 
 def run_http_server():
     """Run HTTP server in background thread"""
-    server = HTTPServer(('0.0.0.0', PORT), HealthCheckHandler)
-    print(f"HTTP server running on port {PORT}")
-    server.serve_forever()
+    try:
+        server = HTTPServer(('0.0.0.0', PORT), HealthCheckHandler)
+        print(f"HTTP server started successfully on port {PORT}")
+        print(f"Health check available at: http://0.0.0.0:{PORT}/health")
+        server.serve_forever()
+    except Exception as e:
+        print(f"Failed to start HTTP server: {e}")
+        import traceback
+        traceback.print_exc()
 
 # ---------------- ERROR HANDLER ---------------- #
 
@@ -961,7 +978,7 @@ async def pm_out(ctx):
     hours_worked = calculate_hours_worked(record)
     if hours_worked:
         hours_display = format_hours_display(hours_worked)
-        message += f"\n\n**Total Hours Worked: {hours_display}**"
+        message += f"\n\n**Total Hours Worked: {hours_display}**"   
 
         if hours_worked >= REQUIRED_HOURS:
             message += f"\n**Completed {REQUIRED_HOURS}-hour requirement!**"
@@ -1129,9 +1146,16 @@ async def reminder_loop():
 
 # ---------------- RUN ---------------- #
 if __name__ == "__main__":
+    print(f"Starting bot with PORT={PORT}")
+    
     # Start HTTP server in background thread
     server_thread = threading.Thread(target=run_http_server, daemon=True)
     server_thread.start()
     
+    # Give the server a moment to start
+    import time
+    time.sleep(2)
+    
+    print("Starting Discord bot...")
     # Run Discord bot (blocking)
     bot.run(DISCORD_TOKEN)
