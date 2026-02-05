@@ -46,16 +46,27 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # --- Flask App for Health Checks ---
 app = Flask(__name__)
 
+# Track if bot is ready
+bot_ready = False
+
 
 @app.route('/')
 @app.route('/health')
 def health_check():
     """Health check endpoint for UptimeRobot and Render"""
-    return 'OK', 200
+    if bot_ready:
+        return 'OK - Bot Ready', 200
+    else:
+        return 'Starting...', 503
 
 
 def run_flask():
     """Run Flask server in background thread"""
+    # Silence Flask startup messages to reduce log noise
+    import logging
+    log = logging.getLogger('werkzeug')
+    log.setLevel(logging.ERROR)
+
     app.run(host='0.0.0.0', port=PORT, debug=False, use_reloader=False)
 # --------------------------------
 
@@ -474,8 +485,11 @@ async def on_command_error(ctx, error):
 
 @bot.event
 async def on_ready():
+    global bot_ready
+    bot_ready = True
     print(f"{bot.user} is now online!")
     print(f"Loaded {len(user_names)} authorized users")
+    print("✅ Bot is ready to receive commands!")
 
 # ---------------- ADMIN COMMANDS ---------------- #
 
@@ -1125,6 +1139,19 @@ async def help_dtr(ctx):
 if __name__ == "__main__":
     import time
     import sys
+    import fcntl
+
+    # Prevent multiple instances from running
+    LOCK_FILE = "/tmp/dtr_bot.lock"
+    lock_file = None
+
+    try:
+        lock_file = open(LOCK_FILE, 'w')
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        print("🔒 Lock acquired - bot instance starting")
+    except IOError:
+        print("❌ Another instance is already running. Exiting.")
+        sys.exit(0)
 
     print(f"Starting DTR HAWKS Bot...")
     print(f"PORT: {PORT}")
@@ -1137,8 +1164,11 @@ if __name__ == "__main__":
     print(f"Flask server started on port {PORT}")
     print(f"Health endpoint: http://0.0.0.0:{PORT}/health")
 
-    # Give Flask a moment to start
-    time.sleep(2)
+    # Give Flask more time to stabilize on Render free tier
+    print("⏳ Waiting for Flask to stabilize...")
+    time.sleep(5)
+
+    print("🚀 Ready to start Discord bot")
 
     # Discord bot with retry logic
     max_retries = 5
@@ -1167,6 +1197,9 @@ if __name__ == "__main__":
 
                 if attempt == max_retries - 1:
                     print(f"Max retries reached. Exiting.")
+                    if lock_file:
+                        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                        lock_file.close()
                     sys.exit(1)
             else:
                 print(f"HTTP Error: {e}")
@@ -1174,6 +1207,9 @@ if __name__ == "__main__":
 
         except discord.errors.LoginFailure as e:
             print(f"Invalid Discord token!")
+            if lock_file:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                lock_file.close()
             sys.exit(1)
 
         except Exception as e:
@@ -1182,6 +1218,14 @@ if __name__ == "__main__":
             if attempt < max_retries - 1:
                 time.sleep(base_delay)
             else:
+                if lock_file:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                    lock_file.close()
                 sys.exit(1)
 
     print(f"Bot started successfully!")
+
+    # Cleanup lock file on normal exit
+    if lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        lock_file.close()
