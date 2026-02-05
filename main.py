@@ -1,4 +1,3 @@
-
 import discord
 from discord.ext import commands
 import gspread
@@ -9,8 +8,8 @@ import json
 import os
 import random
 import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
 import asyncio
+from flask import Flask
 
 # ---------------- CONFIG ---------------- #
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
@@ -22,18 +21,8 @@ PORT = int(os.getenv("PORT", 8080))  # Render provides PORT env variable
 TIMEZONE = pytz.timezone("Asia/Manila")
 AM_IN_CUTOFF = (10, 0)            # 10:00 AM - late threshold (hour, minute)
 REQUIRED_HOURS = 8                # Required work hours per day
-# Add Discord user IDs of admins here (ints)
-ADMIN_IDS = [1429858548392792288, 896989800786190337, 830704365438369792]
-MORNING_PERSON_CUTOFF = (7, 40)   # Anyone before this is a morning person
+MORNING_PERSON_CUTOFF = (7, 44)   # Anyone before this is a morning person
 # ---------------------------------------- #
-
-# ---------------- REMINDER ---------------- #
-
-REMINDER_THRESHOLD_MINUTES = 5  # Minutes before 8 hours
-
-# reminder state
-reminded_today = set()
-last_reminder_date = None
 
 # --- Google Sheets Setup ---
 scope = [
@@ -42,10 +31,7 @@ scope = [
 ]
 
 # Path to secret file mounted by Render
-cred_path = os.getenv(
-    "google_credentials.json"
-)
-
+cred_path = os.getenv("GOOGLE_CREDS_PATH", "google_credentials.json")
 creds = ServiceAccountCredentials.from_json_keyfile_name(cred_path, scope)
 
 client = gspread.authorize(creds)
@@ -58,18 +44,71 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 # --------------------------------
 
-# ---------------- STORAGE ---------------- #
-USERS_FILE = "users.json"
+# --- Flask App for Health Checks ---
+app = Flask(__name__)
+
+
+@app.route('/')
+@app.route('/health')
+def health_check():
+    """Health check endpoint for UptimeRobot and Render"""
+    return 'OK', 200
+
+
+def run_flask():
+    """Run Flask server in background thread"""
+    app.run(host='0.0.0.0', port=PORT, debug=False, use_reloader=False)
+# --------------------------------
+
+# ---------------- USERS STORAGE ---------------- #
+# Pre-loaded users - no registration needed!
+# Format: {"discord_id": "Full Name"}
+
+
+# Check if running on Render (production) or locally
+if os.path.exists("/etc/secrets"):
+    # Production - Render secret files
+    USERS_FILE = "/etc/secrets/users.json"
+    ADMINS_FILE = "/etc/secrets/admins.json"
+else:
+    # Local development
+    USERS_FILE = "users.json"
+    ADMINS_FILE = "admins.json"
 
 if os.path.exists(USERS_FILE):
     with open(USERS_FILE, "r") as f:
         user_names = json.load(f)
 else:
+    # Default empty users - add your team members here or use !add_user command
     user_names = {}
-# No temporary in-memory DTR storage — everything is appended to Google Sheets.
+    # Save the default (only works locally, not on Render)
+    if not USERS_FILE.startswith("/etc/secrets"):
+        with open(USERS_FILE, "w") as f:
+            json.dump(user_names, f, indent=4)
+
+# Load admin IDs from separate file for security
+if os.path.exists(ADMINS_FILE):
+    with open(ADMINS_FILE, "r") as f:
+        admin_data = json.load(f)
+        ADMIN_IDS = admin_data.get("admin_ids", [])
+else:
+    # Default empty admins - YOU MUST ADD AT LEAST ONE ADMIN
+    ADMIN_IDS = []
+    # Save the default (only works locally, not on Render)
+    if not ADMINS_FILE.startswith("/etc/secrets"):
+        with open(ADMINS_FILE, "w") as f:
+            json.dump({"admin_ids": []}, f, indent=4)
+    print("⚠️  WARNING: No admins configured! Please add admin IDs to admins.json")
 # ----------------------------------------
 
 # ---------------- HELPERS ---------------- #
+
+
+def strip_leading_apostrophe(s: str) -> str:
+    """Remove any leading apostrophe from a string."""
+    if s.startswith("'"):
+        return s[1:]
+    return s
 
 
 def now():
@@ -90,16 +129,9 @@ def pretty_date():
 
 def timestamp_str():
     """Full timestamp used for the sheet Timestamp column:
-       Format: M/D/YYYY H:MM:SS AM/PM  (no padded month/day)"""
-    """n = now()
-    return f"{n.month}/{n.day}/{n.year} {n.hour}:{n.minute:02d}:{n.second:02d}"""
-
+       Format: M/D/YYYY HH:MM:SS (24-hour format)"""
     n = now()
-    hour_12 = n.hour % 12
-    if hour_12 == 0:
-        hour_12 = 12
-    am_pm = "AM" if n.hour < 12 else "PM"
-    return f"{n.month}/{n.day}/{n.year} {hour_12}:{n.minute:02d}:{n.second:02d} {am_pm}"
+    return f"{n.month}/{n.day}/{n.year} {n.hour}:{n.minute:02d}:{n.second:02d}"
 
 # --- Time formatting helpers (SHEET vs DISCORD) ---
 
@@ -158,9 +190,12 @@ def format_name_with_initials(full_name):
 
 
 def get_user_name(ctx):
-    """Return the formatted name registered for the Discord user, or None."""
+    """Return the formatted name for the Discord user, or None if not authorized."""
     uid = str(ctx.author.id)
-    return user_names.get(uid, None)
+    raw_name = user_names.get(uid, None)
+    if raw_name:
+        return format_name_with_initials(raw_name)
+    return None
 
 
 def is_late():
@@ -174,23 +209,27 @@ def is_late():
 
 def parse_time_from_string(time_string):
     """
-    Parse time strings to a timezone-aware datetime (today's date in TIMEZONE).
+    Parse time strings to a datetime object (today's date).
+    Accepts formats:
+      - "H:MM:SS AM/PM"  (sheet format)
+      - "HH:MM:SS"       (24-hour, optional)
+      - "H:MM AM/PM"     (discord format)
+    Returns a naive datetime (date is today) or None if parsing fails.
     """
     if not time_string:
         return None
     try:
         time_string = time_string.strip()
         formats = [
-            "%I:%M:%S %p",
-            "%H:%M:%S",
-            "%I:%M %p",
+            "%I:%M:%S %p",  # e.g., "7:00:00 AM"
+            "%H:%M:%S",     # e.g., "19:00:00"
+            "%I:%M %p",     # e.g., "7:00 AM"
         ]
         for fmt in formats:
             try:
                 t = datetime.strptime(time_string, fmt).time()
-                naive_dt = datetime.combine(now().date(), t)
-                aware_dt = TIMEZONE.localize(naive_dt)
-                return aware_dt
+                # combine with today's date (naive) for arithmetic/comparisons
+                return datetime.combine(now().date(), t)
             except ValueError:
                 continue
         return None
@@ -360,102 +399,6 @@ def is_admin(user_id):
     """Check if a numeric Discord user_id is in ADMIN_IDS."""
     return user_id in ADMIN_IDS
 
-# --- Name validation ---
-
-
-async def reminder_loop():
-    global last_reminder_date
-    await bot.wait_until_ready()
-
-    while not bot.is_closed():
-        try:
-            today_str = today()
-
-            # reset daily
-            if last_reminder_date != today_str:
-                reminded_today.clear()
-                last_reminder_date = today_str
-
-            for uid, full_name in user_names.items():
-                try:
-                    uid_int = int(uid)
-
-                    user = bot.get_user(uid_int)
-                    if user is None:
-                        try:
-                            user = await bot.fetch_user(uid_int)
-                        except Exception:
-                            user = None
-
-                    if not user:
-                        continue
-
-                    # already reminded today
-                    if uid_int in reminded_today:
-                        continue
-
-                    name = format_name_with_initials(full_name)
-                    record = get_full_record(name)
-
-                    if record["AM_IN"] and record["AM_OUT"]:
-
-                        if not record["PM_IN"] or record["PM_OUT"]:
-                            continue
-
-                        if record["PM_IN"] and not record["PM_OUT"]:
-                            hours_worked = calculate_hours_worked(record)
-
-                            if hours_worked is None:
-                                am_in = parse_time_from_string(record["AM_IN"])
-                                am_out = parse_time_from_string(
-                                    record["AM_OUT"])
-                                pm_in = parse_time_from_string(record["PM_IN"])
-
-                                if am_in and am_out and pm_in:
-                                    total_seconds = (
-                                        am_out - am_in).total_seconds() + (now() - pm_in).total_seconds()
-                                    hours_worked = total_seconds / 3600
-
-                            if hours_worked is None:
-                                continue
-
-                            remaining = REQUIRED_HOURS - hours_worked
-
-                            if 0 < remaining <= REMINDER_THRESHOLD_MINUTES / 60:
-
-                                try:
-                                    await user.send(
-                                        f"Hi {name}! You're almost at {REQUIRED_HOURS} hours today. "
-                                        "Don't forget to `!pm_out` to complete your DTR."
-                                    )
-                                    reminded_today.add(uid_int)
-
-                                except Exception as e:
-                                    print(
-                                        f"Failed to send reminder to {name}: {e}")
-
-                except Exception as inner_e:
-                    print(f"Reminder user error {uid}: {inner_e}")
-
-        except Exception as e:
-            print(f"Reminder loop error: {e}")
-
-        await asyncio.sleep(60)
-
-
-def validate_name(name):
-    """Simple checks for name validity."""
-    if not name or len(name.strip()) < 3:
-        return False, "Name must be at least 3 characters long."
-    if len(name) > 100:
-        return False, "Name is too long (max 100 characters)."
-    if not all(c.isalpha() or c.isspace() or c in ".-'" for c in name):
-        return False, "Name can only contain letters, spaces, hyphens, apostrophes, and periods."
-    parts = name.strip().split()
-    if len(parts) < 2:
-        return False, "Please provide at least a first name and last name."
-    return True, None
-
 # --- Discord message formatter ---
 
 
@@ -487,51 +430,44 @@ MESSAGES_FILE = "messages.json"
 if os.path.exists(MESSAGES_FILE):
     with open(MESSAGES_FILE, "r", encoding="utf-8") as f:
         messages = json.load(f)
-
 else:
     messages = {"morning_person": [], "normal": [], "late": []}
-
-# ---------------- HTTP SERVER ---------------- #
-
-
-class HealthCheckHandler(BaseHTTPRequestHandler):
-    """Simple HTTP handler for health checks - thread-safe by design"""
-
-    def do_GET(self):
-        """Handle GET requests - only responds to health check endpoint"""
-        if self.path == '/' or self.path == '/health':
-            self.send_response(200)
-            self.send_header('Content-type', 'text/plain')
-            self.end_headers()
-            self.wfile.write(b'OK')
-        else:
-            self.send_response(404)
-            self.end_headers()
-
-    def log_message(self, format, *args):
-        """Suppress default logging to avoid clutter"""
-        pass
-
-
-def run_http_server():
-    """Run HTTP server in background thread"""
-    server = HTTPServer(('0.0.0.0', PORT), HealthCheckHandler)
-    print(f"HTTP server running on port {PORT}")
-    server.serve_forever()
 
 # ---------------- ERROR HANDLER ---------------- #
 
 
 @bot.event
 async def on_command_error(ctx, error):
-    """Basic command error handling."""
+    """Basic command error handling with user-friendly messages."""
     if isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send(f"Missing required argument: {error.param.name}")
+        # User-friendly messages based on command
+        command = ctx.command.name if ctx.command else "command"
+
+        if command == "add_user":
+            await ctx.send("❌ **Usage:** `!add_user @username Full Name`\n\nExample: `!add_user @john Juan Dela Cruz`")
+        elif command == "change_name":
+            await ctx.send("❌ **Usage:** `!change_name @username New Full Name`\n\nExample: `!change_name @john Juan Miguel Cruz`")
+        elif command == "remove_user":
+            await ctx.send("❌ **Usage:** `!remove_user @username`\n\nExample: `!remove_user @john`")
+        elif command == "manual_entry":
+            await ctx.send(
+                "❌ **Usage:** `!manual_entry @username [am_in|am_out|pm_in|pm_out] [time]`\n\n"
+                "**Examples:**\n"
+                "`!manual_entry @john am_in 8:30 AM`\n"
+                "`!manual_entry @maria pm_out 5:00 PM`\n"
+                "`!manual_entry @pedro am_out 12:00 PM`"
+            )
+        elif command == "view_dtr":
+            await ctx.send("❌ **Usage:** `!view_dtr @username`\n\nExample: `!view_dtr @john`")
+        else:
+            await ctx.send(f"❌ Oops! This command needs more information.\n\nTry `!help_dtr` to see how to use it.")
+
     elif isinstance(error, commands.CommandNotFound):
         # ignore unknown commands silently
         pass
+
     else:
-        await ctx.send(f"An error occurred: {str(error)}")
+        await ctx.send(f"❌ Something went wrong. Please try again or contact an admin.")
         print(f"Error: {error}")
 
 # ---------------- COMMANDS ---------------- #
@@ -542,35 +478,33 @@ async def on_ready():
     print(f"✅ {bot.user} is now online!")
     print(f"✅ Loaded {len(user_names)} authorized users")
 
-    if not hasattr(bot, "reminder_task") or bot.reminder_task.done():
-        bot.reminder_task = bot.loop.create_task(reminder_loop())
+# ---------------- ADMIN COMMANDS ---------------- #
 
 
 @bot.command()
-async def register(ctx, *, full_name: str):
-    """Register your full name for DTR tracking. (One-time only)"""
-    uid = str(ctx.author.id)
-
-    if uid in user_names:
-        await ctx.send(
-            f"You are already registered as **{user_names[uid]}**.\n\n"
-            f"Only admins can change registered names. Please contact an admin if you need to update your name."
-        )
+async def add_user(ctx, user_mention: discord.Member, *, full_name: str):
+    """[ADMIN ONLY] Add a new user to the DTR system."""
+    if not is_admin(ctx.author.id):
+        await ctx.send("This command is only available to admins.")
         return
 
-    valid, error_msg = validate_name(full_name)
-    if not valid:
-        await ctx.send(f"{error_msg}")
+    uid = str(user_mention.id)
+
+    if uid in user_names:
+        await ctx.author.send(f"{user_mention.mention} is already registered as **{user_names[uid]}**")
         return
 
     formatted_name = format_name_with_initials(full_name.strip())
-    user_names[uid] = formatted_name
+    user_names[uid] = full_name.strip()
     save_users()
 
-    await ctx.send(
-        f"Successfully registered:\n**{formatted_name}**\n\n"
-        f"You can now use DTR commands!"
+    # Send full info via DM
+    await ctx.author.send(
+        f"Successfully added {user_mention.mention}:\n**{formatted_name}**\n"
+        f"They can now use DTR commands!"
     )
+    # Optional small confirmation in channel
+    await ctx.send(f"{ctx.author.mention}, user added successfully")
 
 
 @bot.command()
@@ -580,27 +514,29 @@ async def change_name(ctx, user_mention: discord.Member, *, new_name: str):
         await ctx.send("This command is only available to admins.")
         return
 
-    valid, error_msg = validate_name(new_name)
-    if not valid:
-        await ctx.send(f"{error_msg}")
+    uid = str(user_mention.id)
+
+    if uid not in user_names:
+        await ctx.author.send(f"{user_mention.mention} is not in the system. Use !add_user first.")
         return
 
-    uid = str(user_mention.id)
-    old_name = user_names.get(uid, "Not registered")
-
+    old_name = format_name_with_initials(user_names[uid])
     formatted_name = format_name_with_initials(new_name.strip())
-    user_names[uid] = formatted_name
+
+    user_names[uid] = new_name.strip()
     save_users()
 
-    await ctx.send(
+    # DM confirmation
+    await ctx.author.send(
         f"Successfully updated name for {user_mention.mention}:\n"
         f"**{old_name}** → **{formatted_name}**"
     )
+    await ctx.send(f"{ctx.author.mention}, name updated successfully")
 
 
 @bot.command()
-async def unregister(ctx, user_mention: discord.Member):
-    """[ADMIN ONLY] Remove a user's registration."""
+async def remove_user(ctx, user_mention: discord.Member):
+    """[ADMIN ONLY] Remove a user from the DTR system."""
     if not is_admin(ctx.author.id):
         await ctx.send("This command is only available to admins.")
         return
@@ -608,29 +544,275 @@ async def unregister(ctx, user_mention: discord.Member):
     uid = str(user_mention.id)
 
     if uid not in user_names:
-        await ctx.send(f"{user_mention.mention} is not registered.")
+        await ctx.author.send(f"{user_mention.mention} is not in the system.")
         return
 
-    removed_name = user_names.pop(uid)
+    removed_name = format_name_with_initials(user_names.pop(uid))
     save_users()
 
-    await ctx.send(f"Successfully unregistered: **{removed_name}** ({user_mention.mention})")
+    # DM confirmation
+    await ctx.author.send(f"Successfully removed: **{removed_name}** ({user_mention.mention})")
+    await ctx.send(f"{ctx.author.mention}, user removed successfully")
 
 
 @bot.command()
 async def list_users(ctx):
-    """[ADMIN ONLY] List all registered users."""
+    """[ADMIN ONLY] List all authorized users."""
     if not is_admin(ctx.author.id):
         await ctx.send("This command is only available to admins.")
         return
 
     if not user_names:
-        await ctx.send("No users registered yet.")
+        await ctx.author.send("No users in the system yet.")
         return
 
+    user_list = []
+    for uid, name in user_names.items():
+        formatted_name = format_name_with_initials(name)
+        if int(uid) in ADMIN_IDS:
+            user_list.append(f"• {formatted_name} - ADMIN")
+        else:
+            user_list.append(f"• {formatted_name}")
+
+    users_display = "\n".join(user_list)
+
+    # Count admins
+    admin_count = sum(1 for uid in user_names.keys() if int(uid) in ADMIN_IDS)
+
+    # Send as DM
+    await ctx.author.send(
+        f"**Authorized Users ({len(user_names)}):**\n"
+        f"Admins: {admin_count} | Regular Users: {len(user_names) - admin_count}\n\n"
+        f"{users_display}"
+    )
+
+    # Optional: confirm in channel that the message was sent
+    await ctx.send(f"{ctx.author.mention}, I sent you the user list in DM")
+
+
+@bot.command()
+async def manual_entry(ctx, user_mention: discord.Member, time_type: str, time_value: str):
+    """[ADMIN ONLY] Manually add or correct a time entry for a user."""
+    if not is_admin(ctx.author.id):
+        await ctx.send("This command is only available to admins.")
+        return
+
+    uid = str(user_mention.id)
+    if uid not in user_names:
+        await ctx.author.send(f"{user_mention.mention} is not in the system. Use !add_user first.")
+        return
+
+    time_type = time_type.lower()
+    valid_types = {"am_in": "AM - Time In", "am_out": "AM - Time Out",
+                   "pm_in": "PM - Time In", "pm_out": "PM - Time Out"}
+
+    if time_type not in valid_types:
+        await ctx.author.send(
+            "Invalid time type. Use one of: `am_in`, `am_out`, `pm_in`, `pm_out`\n"
+            "Example: `!manual_entry @john pm_out 5:00 PM`"
+        )
+        return
+
+    parsed_time = parse_time_from_string(time_value)
+    if not parsed_time:
+        await ctx.author.send(
+            "Invalid time format. Use: `H:MM AM/PM`\nExamples: `8:30 AM`, `12:00 PM`, `5:45 PM`"
+        )
+        return
+
+    hour_12 = parsed_time.hour % 12 or 12
+    am_pm = "AM" if parsed_time.hour < 12 else "PM"
+    time_sheet = f"{hour_12}:{parsed_time.minute:02d}:00 {am_pm}"
+
+    name = format_name_with_initials(user_names[uid])
+
+    record = get_full_record(name)
+    test_record = record.copy()
+    test_record[time_type.upper()] = time_sheet
+
+    valid, error_msg = validate_time_sequence(test_record)
+    if not valid:
+        await ctx.author.send(f"Time Validation Warning: {error_msg}\nYou may still proceed.")
+
+    timestamp = timestamp_str()
+    try:
+        sheet.append_row([timestamp, name, valid_types[time_type],
+                         strip_leading_apostrophe(time_sheet)])
+    except Exception as e:
+        await ctx.author.send(f"Failed to add entry. Please try again or contact support.")
+        print(f"Sheet error: {e}")
+        return
+
+    record = get_full_record(name)
+    message = format_record_message(name, record)
+
+    # DM admin instead of sending in channel
+    await ctx.author.send(
+        f"**Manual Entry Added**\n"
+        f"Admin: {ctx.author.mention}\n"
+        f"User: {user_mention.mention}\n"
+        f"Entry: {valid_types[time_type]} at {time_value}\n\n{message}"
+    )
+    await ctx.send(f"{ctx.author.mention}, manual entry added successfully")
+
+
+@bot.command()
+async def half_day(ctx, half: str = "morning"):
+    """
+    Record a half-day (morning or afternoon).
+    Usage: !half_day morning OR !half_day afternoon
+    """
+    name = get_user_name(ctx)
+    if not name:
+        await ctx.send("You are not authorized to use the DTR system. Please contact an admin.")
+        return
+
+    half = half.lower()
+    if half not in ["morning", "afternoon"]:
+        await ctx.send(
+            "Invalid option.\n"
+            "Use `!half_day morning` or `!half_day afternoon`"
+        )
+        return
+
+    record = get_full_record(name)
+    timestamp = timestamp_str()
+
+    # ─────────────────────────────
+    # MORNING HALF-DAY (AM only)
+    # ─────────────────────────────
+    if half == "morning":
+
+        # Must already have AM times
+        if not record["AM_IN"] or not record["AM_OUT"]:
+            await ctx.send("You must clock **AM IN** and **AM OUT** first.")
+            return
+
+        # Cannot already have PM work
+        if record["PM_IN"] or record["PM_OUT"]:
+            await ctx.send("PM entries already exist. Cannot mark as morning half-day.")
+            return
+
+        try:
+            sheet.append_row([timestamp, name, "PM - Time In", "N/A"])
+            sheet.append_row([timestamp, name, "PM - Time Out", "N/A"])
+        except Exception as e:
+            await ctx.send("Failed to record half-day. Contact an admin.")
+            print(f"Sheet error: {e}")
+            return
+
+        am_in = parse_time_from_string(record["AM_IN"])
+        am_out = parse_time_from_string(record["AM_OUT"])
+
+        message = format_record_message(name, record)
+        message += "\n\n**Half-Day Recorded (Morning)**"
+
+        if am_in and am_out:
+            hours = (am_out - am_in).total_seconds() / 3600
+            message += f"\nMorning Hours: {format_hours_display(hours)}"
+
+        message += "\nPM Times: N/A"
+
+        await ctx.send(message)
+        return
+
+    # ─────────────────────────────
+    # AFTERNOON HALF-DAY (PM only)
+    # ─────────────────────────────
+
+    # Cannot already have AM work
+    if record["AM_IN"] or record["AM_OUT"]:
+        await ctx.send("AM entries already exist. Cannot mark as afternoon half-day.")
+        return
+
+    # Cannot already have PM work
+    if record["PM_IN"] or record["PM_OUT"]:
+        await ctx.send("PM entries already exist.")
+        return
+
+    # Set AM as N/A FIRST
+    try:
+        sheet.append_row([timestamp, name, "AM - Time In", "N/A"])
+        sheet.append_row([timestamp, name, "AM - Time Out", "N/A"])
+    except Exception as e:
+        await ctx.send("Failed to record half-day. Contact an admin.")
+        print(f"Sheet error: {e}")
+        return
+
+    await ctx.send(
+        "**Afternoon Half-Day Set**\n\n"
+        "You may now clock:\n"
+        "• `!pm_in`\n"
+        "• `!pm_out`"
+    )
+
+
+@bot.command()
+async def view_dtr(ctx, user_mention: discord.Member = None):
+    """[ADMIN ONLY] View DTR record for any user today."""
+    if not is_admin(ctx.author.id):
+        await ctx.send("This command is only available to admins.")
+        return
+
+    if not user_mention:
+        await ctx.author.send("Usage: `!view_dtr @username`")
+        return
+
+    uid = str(user_mention.id)
+    if uid not in user_names:
+        await ctx.author.send(f"{user_mention.mention} is not in the system.")
+        return
+
+    name = format_name_with_initials(user_names[uid])
+    record = get_full_record(name)
+
+    if not any(record.values()):
+        await ctx.author.send(f"**{name}** has no DTR record for today yet.")
+        return
+
+    message = format_record_message(name, record)
+
+    if all([record.get("AM_IN"), record.get("AM_OUT"), record.get("PM_IN"), record.get("PM_OUT")]):
+        if record.get("PM_IN") == "N/A" or record.get("PM_OUT") == "N/A":
+            am_in = parse_time_from_string(record.get("AM_IN", ""))
+            am_out = parse_time_from_string(record.get("AM_OUT", ""))
+            if am_in and am_out:
+                morning_hours = (am_out - am_in).total_seconds() / 3600
+                hours_display = format_hours_display(morning_hours)
+                message += f"\n\n**Half-Day**\nMorning Hours: {hours_display}"
+        else:
+            hours_worked = calculate_hours_worked(record)
+            if hours_worked:
+                hours_display = format_hours_display(hours_worked)
+                message += f"\n\n**Total Hours Worked: {hours_display}"
+                if hours_worked >= REQUIRED_HOURS:
+                    message += f"\n**Completed {REQUIRED_HOURS}-hour requirement!**"
+                else:
+                    shortage = REQUIRED_HOURS - hours_worked
+                    shortage_display = format_hours_display(shortage)
+                    message += f"\n**Undertime: {shortage_display}**"
+
+    await ctx.author.send(f"**DTR Record for {user_mention.mention}**\n\n{message}")
+    await ctx.send(f"{ctx.author.mention}, DTR record sent to your DM")
+
+
+@bot.command()
+async def users(ctx):
+    """List all users in the DTR system (anyone can use this)."""
+    if not user_names:
+        await ctx.send("No users in the system yet.")
+        return
+
+    # Sort users alphabetically by name
+    sorted_users = sorted(
+        [(format_name_with_initials(name), name)
+         for name in user_names.values()],
+        key=lambda x: x[0]
+    )
+
     user_list = "\n".join(
-        [f"• {name} (ID: {uid})" for uid, name in user_names.items()])
-    await ctx.send(f"**Registered Users ({len(user_names)}):**\n\n{user_list}")
+        [f"• {formatted_name}" for formatted_name, _ in sorted_users])
+    await ctx.send(f"**DTR System Users ({len(user_names)}):**\n\n{user_list}")
 
 # ---------------- Clock commands ---------------- #
 
@@ -640,7 +822,7 @@ async def am_in(ctx):
     """Clock in for the morning shift."""
     name = get_user_name(ctx)
     if not name:
-        await ctx.send("Please register first using !register FirstName MiddleName LastName")
+        await ctx.send("You are not authorized to use the DTR system. Please contact an admin.")
         return
 
     record = get_full_record(name)
@@ -650,10 +832,12 @@ async def am_in(ctx):
 
     timestamp = timestamp_str()
     time_sheet = time_for_sheets()       # for Google Sheets
+    time_discord = time_for_discord()     # for Discord messages
     late_status = is_late()
 
     try:
-        sheet.append_row([timestamp, name, "AM - Time In", time_sheet])
+        sheet.append_row([timestamp, name, "AM - Time In",
+                         strip_leading_apostrophe(time_sheet)])
     except Exception as e:
         await ctx.send(f"Failed to record AM IN. Please try again or contact admin.")
         print(f"Sheet error: {e}")
@@ -682,7 +866,7 @@ async def am_out(ctx):
     """Clock out for lunch break."""
     name = get_user_name(ctx)
     if not name:
-        await ctx.send("Please register first using !register FirstName MiddleName LastName")
+        await ctx.send("You are not authorized to use the DTR system. Please contact an admin.")
         return
 
     record = get_full_record(name)
@@ -712,7 +896,8 @@ async def am_out(ctx):
         return
 
     try:
-        sheet.append_row([timestamp, name, "AM - Time Out", time_sheet])
+        sheet.append_row([timestamp, name, "AM - Time Out",
+                         strip_leading_apostrophe(time_sheet)])
     except Exception as e:
         await ctx.send(f"Failed to record AM OUT. Please try again or contact admin.")
         print(f"Sheet error: {e}")
@@ -728,7 +913,7 @@ async def pm_in(ctx):
     """Clock in after lunch break."""
     name = get_user_name(ctx)
     if not name:
-        await ctx.send("Please register first using !register FirstName MiddleName LastName")
+        await ctx.send("You are not authorized to use the DTR system. Please contact an admin.")
         return
 
     record = get_full_record(name)
@@ -753,11 +938,12 @@ async def pm_in(ctx):
     valid, error_msg = validate_time_sequence(test_record)
 
     if not valid:
-        await ctx.send(f"❌ {error_msg}")
+        await ctx.send(f"{error_msg}")
         return
 
     try:
-        sheet.append_row([timestamp, name, "PM - Time In", time_sheet])
+        sheet.append_row([timestamp, name, "PM - Time In",
+                         strip_leading_apostrophe(time_sheet)])
     except Exception as e:
         await ctx.send(f"Failed to record PM IN. Please try again or contact admin.")
         print(f"Sheet error: {e}")
@@ -773,7 +959,7 @@ async def pm_out(ctx):
     """Clock out at end of workday."""
     name = get_user_name(ctx)
     if not name:
-        await ctx.send("Please register first using !register FirstName MiddleName LastName")
+        await ctx.send("You are not authorized to use the DTR system. Please contact an admin.")
         return
 
     record = get_full_record(name)
@@ -799,7 +985,8 @@ async def pm_out(ctx):
         await ctx.send(f"Time validation warning: {error_msg}")
 
     try:
-        sheet.append_row([timestamp, name, "PM - Time Out", time_sheet])
+        sheet.append_row([timestamp, name, "PM - Time Out",
+                         strip_leading_apostrophe(time_sheet)])
     except Exception as e:
         await ctx.send(f"Failed to record PM OUT. Please try again or contact admin.")
         print(f"Sheet error: {e}")
@@ -823,8 +1010,6 @@ async def pm_out(ctx):
     else:
         message += "\n\n**Complete DTR for today!**"
 
-    reminded_today.discard(ctx.author.id)
-
     await ctx.send(message)
 
 # ---------------- Status & Help ---------------- #
@@ -835,7 +1020,7 @@ async def status(ctx):
     """Check your current DTR status for today."""
     name = get_user_name(ctx)
     if not name:
-        await ctx.send("Please register first using !register FirstName MiddleName LastName")
+        await ctx.send("You are not authorized to use the DTR system. Please contact an admin.")
         return
 
     record = get_full_record(name)
@@ -869,47 +1054,207 @@ async def help_dtr(ctx):
     is_user_admin = is_admin(ctx.author.id)
 
     help_text = """
-**DTR HAWKS Bot Commands**
+**🕒 DTR HAWKS Bot Commands**
 
-**Setup:**
-!register FirstName MiddleName LastName - Register your name (one-time only)
-
-**Daily Time Recording:**
-!am_in - Clock in (morning)
+━━━━━━━━━━━━━━━━━━
+**Daily Time Recording**
+━━━━━━━━━━━━━━━━━━
+!am_in  - Clock in (morning)
 !am_out - Clock out (lunch break)
-!pm_in - Clock in (after lunch)
+!pm_in  - Clock in (afternoon)
 !pm_out - Clock out (end of day)
 
-**Info:**
-!status - Check your DTR for today
-!help_dtr - Show this help message
+━━━━━━━━━━━━━━━━━━
+**Half-Day Options**
+━━━━━━━━━━━━━━━━━━
+!half_day morning
+• Use AFTER you finish morning work
+• Required: AM IN → AM OUT
+• PM times will be marked as N/A
 
-**Notes:**
-• You must register before using DTR commands
-• Names are automatically formatted with middle initial (e.g., "Juan D. Cruz")
-• You can only register once - contact admin to change name
-• Follow the sequence: AM IN → AM OUT → PM IN → PM OUT
+!half_day afternoon
+• Use BEFORE starting afternoon work
+• AM times will be marked as N/A
+• Then clock: PM IN → PM OUT
+
+━━━━━━━━━━━━━━━━━━
+**Info Commands**
+━━━━━━━━━━━━━━━━━━
+!status    - View your DTR for today
+!help_dtr  - Show this help message
+
+━━━━━━━━━━━━━━━━━━
+**Important Notes**
+━━━━━━━━━━━━━━━━━━
+• Only authorized users can use DTR commands
+• Follow the full-day sequence:
+  AM IN → AM OUT → PM IN → PM OUT
+• Morning half-day = confirm AFTER AM OUT
+• Afternoon half-day = declare BEFORE PM IN
 • Late threshold: 10:00 AM
-• Required work hours: 8 hours
-• Times are automatically validated
-• Once PM OUT is recorded, the day is complete and cannot be modified
-    """
+"""
 
     if is_user_admin:
         help_text += """
-**Admin Commands:**
-!change_name @user NewName - Change a user's registered name
-!unregister @user - Remove user registration
-!list_users - List all registered users
-        """
+━━━━━━━━━━━━━━━━━━
+**🔐 Admin Commands**
+━━━━━━━━━━━━━━━━━━
+!add_user @user Full Name
+!change_name @user New Name
+!remove_user @user
+!list_users
+!view_dtr @user
+!manual_entry @user [am_in | am_out | pm_in | pm_out] [time]
 
+━━━━━━━━━━━━━━━━━━
+**Manual Entry Examples**
+━━━━━━━━━━━━━━━━━━
+!manual_entry @john am_in 8:30 AM
+!manual_entry @maria pm_out 5:00 PM
+!manual_entry @pedro am_out 12:00 PM
+
+━━━━━━━━━━━━━━━━━━
+**Admin Use Cases**
+━━━━━━━━━━━━━━━━━━
+• User forgot to clock → add missing time
+• Wrong time recorded → correct entry
+• Fix time sequence issues
+"""
     await ctx.send(help_text)
+
+# ---------------- REMINDER ---------------- #
+
+REMINDER_THRESHOLD_MINUTES = 5  # Minutes before 8 hours
+
+
+async def reminder_loop():
+    await bot.wait_until_ready()  # ensure bot is fully online
+    while not bot.is_closed():
+        for uid, full_name in user_names.items():
+            user = bot.get_user(int(uid))
+            if not user:
+                # skip if bot can't find user (offline or left server)
+                continue
+
+            name = format_name_with_initials(full_name)
+            record = get_full_record(name)
+
+            # Only check if AM/PM times exist
+            if record["AM_IN"] and record["AM_OUT"]:
+                # If it's a half-day, PM_IN or PM_OUT will be "N/A"
+                if record["PM_IN"] == "N/A" or record["PM_OUT"] == "N/A":
+                    continue  # skip reminders for half-day users
+
+                # If PM_IN exists but PM_OUT is empty, calculate hours
+                if record["PM_IN"] and not record["PM_OUT"]:
+                    hours_worked = calculate_hours_worked(record)
+                    if hours_worked is None:
+                        # calculate based on current time
+                        am_in = parse_time_from_string(record["AM_IN"])
+                        am_out = parse_time_from_string(record["AM_OUT"])
+                        pm_in = parse_time_from_string(record["PM_IN"])
+                        if am_in and am_out and pm_in:
+                            total_seconds = (
+                                am_out - am_in).total_seconds() + (now() - pm_in).total_seconds()
+                            hours_worked = total_seconds / 3600
+
+                    if hours_worked and REQUIRED_HOURS - hours_worked <= REMINDER_THRESHOLD_MINUTES / 60:
+                        try:
+                            await user.send(
+                                f"Hi {name}! You're almost at {REQUIRED_HOURS} hours today. "
+                                "Don't forget to `!pm_out` to complete your DTR."
+                            )
+                        except Exception as e:
+                            print(f"Failed to send reminder to {name}: {e}")
+
+        await asyncio.sleep(60)  # check every 1 minute
 
 # ---------------- RUN ---------------- #
 if __name__ == "__main__":
-    # Start HTTP server in background thread
-    server_thread = threading.Thread(target=run_http_server, daemon=True)
-    server_thread.start()
+    import time
+    import sys
 
-    # Run Discord bot (blocking)
-    bot.run(DISCORD_TOKEN)
+    print(f"Starting DTR HAWKS Bot...")
+    print(f"PORT: {PORT}")
+    print(f"Timezone: {TIMEZONE}")
+
+    # Start Flask server in background thread
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+
+    print(f"Flask server started on port {PORT}")
+    print(f"Health endpoint: http://0.0.0.0:{PORT}/health")
+
+    # Give Flask a moment to start
+    time.sleep(2)
+
+    # Discord bot with retry logic
+    max_retries = 5
+    # Start with 30 seconds (longer initial delay to avoid rate limits)
+    base_delay = 30
+
+    for attempt in range(max_retries):
+        try:
+            print(
+                f"[Attempt {attempt + 1}/{max_retries}] Starting Discord bot...")
+
+            # Start reminder loop in background
+            bot.loop.create_task(reminder_loop())
+
+            # Run Discord bot (blocking call)
+            bot.run(DISCORD_TOKEN)
+
+            # If we get here without exception, connection was successful
+            break
+
+        except discord.errors.HTTPException as e:
+            error_str = str(e)
+
+            # Check if it's a rate limit error (429 or Cloudflare 1015)
+            if "429" in error_str or "rate limit" in error_str.lower() or "1015" in error_str:
+                # Calculate exponential backoff delay
+                wait_time = base_delay * (2 ** attempt)
+
+                # Cap maximum wait time at 10 minutes
+                wait_time = min(wait_time, 600)
+
+                print(f"Rate limited by Discord/Cloudflare!")
+                print(
+                    f"Waiting {wait_time} seconds before retry {attempt + 1}/{max_retries}...")
+                print(f"Your IP: Check Render logs for Cloudflare Ray ID")
+
+                # Wait before retrying
+                time.sleep(wait_time)
+
+                # If this was the last attempt, exit
+                if attempt == max_retries - 1:
+                    print(f"Max retries ({max_retries}) reached. Exiting.")
+                    print(
+                        f"Tip: Wait 15-30 minutes before redeploying to let rate limits expire.")
+                    sys.exit(1)
+
+            else:
+                # Different HTTP error - log and re-raise
+                print(f"HTTP Error (non-rate-limit): {e}")
+                raise
+
+        except discord.errors.LoginFailure as e:
+            print(
+                f"Invalid Discord token! Check your DISCORD_TOKEN environment variable.")
+            print(f"Error: {e}")
+            sys.exit(1)
+
+        except Exception as e:
+            print(f"Unexpected error: {type(e).__name__}")
+            print(f"Error details: {e}")
+
+            # For unexpected errors, wait a bit before retrying
+            if attempt < max_retries - 1:
+                wait_time = base_delay
+                print(f"Waiting {wait_time} seconds before retry...")
+                time.sleep(wait_time)
+            else:
+                print(f"Max retries reached. Exiting.")
+                sys.exit(1)
+
+    print(f"Bot started successfully!")
