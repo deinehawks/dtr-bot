@@ -31,7 +31,7 @@ scope = [
 ]
 
 # Path to secret file mounted by Render
-cred_path = os.getenv("GOOGLE_CREDS_PATH", "google_credentials.json")
+cred_path = "/etc/secrets/google_credentials.json"
 creds = ServiceAccountCredentials.from_json_keyfile_name(cred_path, scope)
 
 client = gspread.authorize(creds)
@@ -477,6 +477,9 @@ async def on_command_error(ctx, error):
 async def on_ready():
     print(f"✅ {bot.user} is now online!")
     print(f"✅ Loaded {len(user_names)} authorized users")
+
+    # Start reminder loop
+    bot.loop.create_task(reminder_loop())
 
 # ---------------- ADMIN COMMANDS ---------------- #
 
@@ -1169,7 +1172,7 @@ async def reminder_loop():
 
         await asyncio.sleep(60)  # check every 1 minute
 
-# ---------------- RUN ---------------- #
+# ---------------- RUN WITH RETRY LOGIC ---------------- #
 if __name__ == "__main__":
     import time
     import sys
@@ -1190,7 +1193,6 @@ if __name__ == "__main__":
 
     # Discord bot with retry logic
     max_retries = 5
-    # Start with 30 seconds (longer initial delay to avoid rate limits)
     base_delay = 30
 
     for attempt in range(max_retries):
@@ -1198,63 +1200,40 @@ if __name__ == "__main__":
             print(
                 f"[Attempt {attempt + 1}/{max_retries}] Starting Discord bot...")
 
-            # Start reminder loop in background
-            bot.loop.create_task(reminder_loop())
-
             # Run Discord bot (blocking call)
+            # The reminder loop will start automatically via @bot.event on_ready
             bot.run(DISCORD_TOKEN)
-
-            # If we get here without exception, connection was successful
             break
 
         except discord.errors.HTTPException as e:
             error_str = str(e)
 
-            # Check if it's a rate limit error (429 or Cloudflare 1015)
             if "429" in error_str or "rate limit" in error_str.lower() or "1015" in error_str:
-                # Calculate exponential backoff delay
                 wait_time = base_delay * (2 ** attempt)
-
-                # Cap maximum wait time at 10 minutes
                 wait_time = min(wait_time, 600)
 
-                print(f"Rate limited by Discord/Cloudflare!")
-                print(
-                    f"Waiting {wait_time} seconds before retry {attempt + 1}/{max_retries}...")
-                print(f"Your IP: Check Render logs for Cloudflare Ray ID")
+                print(f"⚠️  Rate limited by Discord/Cloudflare!")
+                print(f"⏳ Waiting {wait_time} seconds before retry...")
 
-                # Wait before retrying
                 time.sleep(wait_time)
 
-                # If this was the last attempt, exit
                 if attempt == max_retries - 1:
-                    print(f"Max retries ({max_retries}) reached. Exiting.")
-                    print(
-                        f"Tip: Wait 15-30 minutes before redeploying to let rate limits expire.")
+                    print(f"❌ Max retries reached. Exiting.")
                     sys.exit(1)
-
             else:
-                # Different HTTP error - log and re-raise
-                print(f"HTTP Error (non-rate-limit): {e}")
+                print(f"❌ HTTP Error: {e}")
                 raise
 
         except discord.errors.LoginFailure as e:
-            print(
-                f"Invalid Discord token! Check your DISCORD_TOKEN environment variable.")
-            print(f"Error: {e}")
+            print(f"❌ Invalid Discord token!")
             sys.exit(1)
 
         except Exception as e:
-            print(f"Unexpected error: {type(e).__name__}")
+            print(f"❌ Unexpected error: {type(e).__name__}")
             print(f"Error details: {e}")
-
-            # For unexpected errors, wait a bit before retrying
             if attempt < max_retries - 1:
-                wait_time = base_delay
-                print(f"Waiting {wait_time} seconds before retry...")
-                time.sleep(wait_time)
+                time.sleep(base_delay)
             else:
-                print(f"Max retries reached. Exiting.")
                 sys.exit(1)
 
-    print(f"Bot started successfully!")
+    print(f"✅ Bot started successfully!")
