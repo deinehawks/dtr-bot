@@ -8,7 +8,6 @@ import json
 import os
 import random
 import threading
-import asyncio
 from flask import Flask
 
 # ---------------- CONFIG ---------------- #
@@ -475,11 +474,8 @@ async def on_command_error(ctx, error):
 
 @bot.event
 async def on_ready():
-    print(f"✅ {bot.user} is now online!")
-    print(f"✅ Loaded {len(user_names)} authorized users")
-
-    # Start reminder loop
-    bot.loop.create_task(reminder_loop())
+    print(f"{bot.user} is now online!")
+    print(f"Loaded {len(user_names)} authorized users")
 
 # ---------------- ADMIN COMMANDS ---------------- #
 
@@ -1125,53 +1121,6 @@ async def help_dtr(ctx):
 """
     await ctx.send(help_text)
 
-# ---------------- REMINDER ---------------- #
-
-REMINDER_THRESHOLD_MINUTES = 5  # Minutes before 8 hours
-
-
-async def reminder_loop():
-    await bot.wait_until_ready()  # ensure bot is fully online
-    while not bot.is_closed():
-        for uid, full_name in user_names.items():
-            user = bot.get_user(int(uid))
-            if not user:
-                # skip if bot can't find user (offline or left server)
-                continue
-
-            name = format_name_with_initials(full_name)
-            record = get_full_record(name)
-
-            # Only check if AM/PM times exist
-            if record["AM_IN"] and record["AM_OUT"]:
-                # If it's a half-day, PM_IN or PM_OUT will be "N/A"
-                if record["PM_IN"] == "N/A" or record["PM_OUT"] == "N/A":
-                    continue  # skip reminders for half-day users
-
-                # If PM_IN exists but PM_OUT is empty, calculate hours
-                if record["PM_IN"] and not record["PM_OUT"]:
-                    hours_worked = calculate_hours_worked(record)
-                    if hours_worked is None:
-                        # calculate based on current time
-                        am_in = parse_time_from_string(record["AM_IN"])
-                        am_out = parse_time_from_string(record["AM_OUT"])
-                        pm_in = parse_time_from_string(record["PM_IN"])
-                        if am_in and am_out and pm_in:
-                            total_seconds = (
-                                am_out - am_in).total_seconds() + (now() - pm_in).total_seconds()
-                            hours_worked = total_seconds / 3600
-
-                    if hours_worked and REQUIRED_HOURS - hours_worked <= REMINDER_THRESHOLD_MINUTES / 60:
-                        try:
-                            await user.send(
-                                f"Hi {name}! You're almost at {REQUIRED_HOURS} hours today. "
-                                "Don't forget to `!pm_out` to complete your DTR."
-                            )
-                        except Exception as e:
-                            print(f"Failed to send reminder to {name}: {e}")
-
-        await asyncio.sleep(60)  # check every 1 minute
-
 # ---------------- RUN WITH RETRY LOGIC ---------------- #
 if __name__ == "__main__":
     import time
@@ -1201,7 +1150,6 @@ if __name__ == "__main__":
                 f"[Attempt {attempt + 1}/{max_retries}] Starting Discord bot...")
 
             # Run Discord bot (blocking call)
-            # The reminder loop will start automatically via @bot.event on_ready
             bot.run(DISCORD_TOKEN)
             break
 
@@ -1212,28 +1160,28 @@ if __name__ == "__main__":
                 wait_time = base_delay * (2 ** attempt)
                 wait_time = min(wait_time, 600)
 
-                print(f"⚠️  Rate limited by Discord/Cloudflare!")
-                print(f"⏳ Waiting {wait_time} seconds before retry...")
+                print(f"Rate limited by Discord/Cloudflare!")
+                print(f"Waiting {wait_time} seconds before retry...")
 
                 time.sleep(wait_time)
 
                 if attempt == max_retries - 1:
-                    print(f"❌ Max retries reached. Exiting.")
+                    print(f"Max retries reached. Exiting.")
                     sys.exit(1)
             else:
-                print(f"❌ HTTP Error: {e}")
+                print(f"HTTP Error: {e}")
                 raise
 
         except discord.errors.LoginFailure as e:
-            print(f"❌ Invalid Discord token!")
+            print(f"Invalid Discord token!")
             sys.exit(1)
 
         except Exception as e:
-            print(f"❌ Unexpected error: {type(e).__name__}")
+            print(f"Unexpected error: {type(e).__name__}")
             print(f"Error details: {e}")
             if attempt < max_retries - 1:
                 time.sleep(base_delay)
             else:
                 sys.exit(1)
 
-    print(f"✅ Bot started successfully!")
+    print(f"Bot started successfully!")
