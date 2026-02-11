@@ -23,7 +23,7 @@ GOOGLE_CREDS_PATH = os.getenv("GOOGLE_CREDS_PATH", "google_credentials.json")
 TIMEZONE = pytz.timezone("Asia/Manila")
 AM_IN_CUTOFF = (10, 0)            # 10:00 AM - late threshold (hour, minute)
 REQUIRED_HOURS = 8                # Required work hours per day
-MORNING_PERSON_CUTOFF = (7, 44)   # Anyone before this is a morning person
+MORNING_PERSON_CUTOFF = (7, 30)   # Anyone before this is a morning person
 # ---------------------------------------- #
 
 # --- Google Sheets Setup ---
@@ -239,9 +239,7 @@ def validate_time_sequence(record):
 # --- Hours calculation ---
 def calculate_hours_worked(record):
     """
-    Calculate total worked hours from AM_IN->AM_OUT and PM_IN->PM_OUT.
-    record values are expected in a parseable format (sheet or discord).
-    Returns total hours as float rounded to 2 decimals, or None if incomplete/invalid.
+    Calculate total worked hours and exclude lunch break (12:00 PM - 1:00 PM).
     """
     try:
         am_in = parse_time_from_string(record.get("AM_IN", ""))
@@ -252,17 +250,38 @@ def calculate_hours_worked(record):
         if not all([am_in, am_out, pm_in, pm_out]):
             return None
 
-        morning_hours = (am_out - am_in).total_seconds() / 3600
-        afternoon_hours = (pm_out - pm_in).total_seconds() / 3600
+        # Basic hours
+        morning_hours = (am_out - am_in).total_seconds()
+        afternoon_hours = (pm_out - pm_in).total_seconds()
 
         if morning_hours < 0 or afternoon_hours < 0:
             return None
 
-        total_hours = morning_hours + afternoon_hours
+        total_seconds = morning_hours + afternoon_hours
+
+        # ---- LUNCH BREAK FIX ----
+        lunch_start = datetime.combine(now().date(), datetime.strptime("12:00 PM", "%I:%M %p").time())
+        lunch_end   = datetime.combine(now().date(), datetime.strptime("1:00 PM", "%I:%M %p").time())
+
+        # Find overlap with lunch
+        work_start = am_in
+        work_end = pm_out
+
+        overlap_start = max(work_start, lunch_start)
+        overlap_end = min(work_end, lunch_end)
+
+        if overlap_start < overlap_end:
+            lunch_overlap = (overlap_end - overlap_start).total_seconds()
+            total_seconds -= lunch_overlap
+        # -------------------------
+
+        total_hours = total_seconds / 3600
         return round(total_hours, 2)
+
     except Exception as e:
         print(f"Hour calculation error: {e}")
         return None
+
 
 def format_hours_display(hours):
     """Format decimal hours (e.g., 7.5) as '7h 30m'."""
